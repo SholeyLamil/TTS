@@ -1,0 +1,41 @@
+# Build output
+bin/
+obj/
+out/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+*.user
+*.suo
+
+# .NET
+project.lock.json
+project.fragment.lock.json
+artifacts/
+*.binlog
+
+# Rider / VS / VS Code
+.idea/
+.vs/
+.vscode/
+
+# Test results
+[Tt]est[Rr]esult*/
+*.trx
+*.coverage
+coverage*.json
+coverage*.xml
+
+# Secrets / local config — never commit real secrets
+.env
+*.env
+!.env.example
+appsettings.*.local.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker / data volumes
+docker/**/data/

@@ -43,8 +43,9 @@ public class InfluxEventTransformerTests
             Data = Data("""{ "amount": 99.5, "retries": 2, "currency": "USD", "success": true }"""),
         }).ToLineProtocol();
 
-        Assert.Contains("amount=99.5", line);   // double field
-        Assert.Contains("retries=2i", line);     // integer field
+        Assert.Contains("amount=99.5", line);    // float field
+        Assert.Contains("retries=2", line);      // numbers stored as float for a consistent type
+        Assert.DoesNotContain("retries=2i", line); // ...explicitly NOT an integer
         Assert.Contains("currency=\"USD\"", line); // string field
         Assert.Contains("success=true", line);   // boolean field
     }

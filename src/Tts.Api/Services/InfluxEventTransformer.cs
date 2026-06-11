@@ -46,19 +46,21 @@ public sealed class InfluxEventTransformer : IEventTransformer
         null => point,
         JsonElement element => AddJsonField(point, key, element),
         bool b => point.Field(key, b),
-        sbyte or byte or short or ushort or int or uint or long => point.Field(key, Convert.ToInt64(value)),
-        float or double or decimal => point.Field(key, Convert.ToDouble(value)),
+        // All numeric data-bag values are stored as float for a consistent field type.
+        // The same field name can carry 250 in one event and 99.5 in another; InfluxDB
+        // locks a field to one type, so mixing int/float would make it reject points.
+        sbyte or byte or short or ushort or int or uint or long
+            or float or double or decimal => point.Field(key, Convert.ToDouble(value)),
         string s => point.Field(key, s),
         _ => point.Field(key, value.ToString() ?? string.Empty),
     };
 
     // System.Text.Json deserialises Dictionary<string, object?> values as JsonElement,
-    // so map each JSON kind onto the right InfluxDB field type.
+    // so map each JSON kind onto the right InfluxDB field type. Numbers are always written
+    // as float to avoid int/float field-type conflicts across events (see AddField).
     private static PointData AddJsonField(PointData point, string key, JsonElement element) => element.ValueKind switch
     {
-        JsonValueKind.Number => element.TryGetInt64(out var l)
-            ? point.Field(key, l)
-            : point.Field(key, element.GetDouble()),
+        JsonValueKind.Number => point.Field(key, element.GetDouble()),
         JsonValueKind.True or JsonValueKind.False => point.Field(key, element.GetBoolean()),
         JsonValueKind.String => point.Field(key, element.GetString() ?? string.Empty),
         JsonValueKind.Null or JsonValueKind.Undefined => point,

@@ -1,92 +1,86 @@
 # Transaction Telemetry Service (TTS) — Project Report
 
-**Date:** 2026-06-11
+**Date:** 2026-06-13
 **Repository:** https://github.com/SholeyLamil/TTS
-**Stack:** .NET 8 · ASP.NET Core · InfluxDB 2.7 · Grafana · Docker
+**Stack:** .NET 8 · Confluent.Kafka · Apache Kafka (KRaft) · InfluxDB 2.7 · Grafana · Docker
+
+> **Architecture update (2026-06-13):** the ingestion model changed. Transaction events
+> are now published to **Kafka** by upstream systems, so TTS no longer exposes an HTTP
+> ingestion API. It **subscribes to the Kafka topic** and, for each message, writes the
+> event to InfluxDB. The reusable core (event model, transformer, batched writer) is
+> unchanged; the HTTP API, auth middleware, and in-memory queue were removed and replaced
+> by a Kafka consumer. Earlier sections referencing `POST /api/events` are superseded.
 
 ---
 
 ## 1. Executive summary
 
-The Transaction Telemetry Service (TTS) is a lightweight .NET 8 API that ingests
-transaction lifecycle events from a payment gateway and stores them in InfluxDB for
-real-time monitoring and reporting through Grafana. Its defining requirement is that
-**telemetry must never slow down or affect payment processing** — so it accepts events,
-queues them in memory, acknowledges immediately (`202 Accepted`), and writes to the
-database asynchronously via a background worker.
+The Transaction Telemetry Service (TTS) is a lightweight .NET 8 service that **consumes
+transaction lifecycle events from a Kafka topic** and stores them in InfluxDB for real-time
+monitoring and reporting through Grafana. It is not in the payment path: upstream systems
+publish events to Kafka, and TTS subscribes and persists them asynchronously.
 
-The service was built, containerised, tested (functional, unit, and load), and a
-performance bottleneck in the storage layer was identified through load testing and
-resolved. **All project success criteria are met.**
+The service was built, containerised, and tested (unit + end-to-end). Kafka provides the
+durable buffer and at-least-once delivery; InfluxDB writes are batched for throughput.
+**All project success criteria are met.**
 
 ---
 
 ## 2. Objective & business context
 
-A payment gateway emits events as transactions move through their lifecycle
-(received, sent for processing, response received, completed, failed, reversed).
-TTS captures these for analytics, monitoring, and operational dashboards. It is **not**
-part of the payment flow and must impose zero latency or failure risk on payments.
+Transaction events (received, sent for processing, response received, completed, failed,
+reversed) are produced to Kafka as transactions move through their lifecycle. TTS captures
+these for analytics, monitoring, and operational dashboards, with no impact on payment processing.
 
 ---
 
 ## 3. Architecture
 
 ```
-Payment Gateway
-      │  POST /api/events  (X-API-Key)
-      ▼
-ApiKeyMiddleware ──► EventsController ──► IEventQueue (in-memory Channel<T>)
-   (auth gate)        (validate, 202)          │  202 returned here, instantly
-                                               ▼
-                              EventProcessingWorker (BackgroundService)
-                                               │
-                       IEventTransformer ──► IInfluxWriter (batched, retry)
-                                               ▼
-                                           InfluxDB ──► Grafana
+Upstream systems ──► Kafka topic (transaction-events)
+                          │  subscribe
+                          ▼
+              KafkaConsumerWorker (BackgroundService)
+                          │  deserialise + transform
+        IEventTransformer ──► IInfluxWriter (batched, retry)
+                          ▼
+                      InfluxDB ──► Grafana
 ```
 
-**Core principle:** accept fast, process separately. The payment gateway never waits
-for the database.
+**Core principle:** Kafka is the durable event source and buffer. The consumer stores an
+offset only after handing a message to the writer (at-least-once delivery).
 
 ### Components
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| API entry / wiring | `Program.cs` | DI registration, middleware, health checks |
-| Security gate | `Middleware/ApiKeyMiddleware.cs` | Validates `X-API-Key`, fail-closed, constant-time |
-| Ingestion endpoint | `Controllers/EventsController.cs` | `POST /api/events`, validate, queue, return 202 |
+| Host / wiring | `Program.cs` | DI registration; serves only health endpoints |
+| Kafka consumer | `Workers/KafkaConsumerWorker.cs` | Subscribe, deserialise, validate, transform, write |
 | Event model | `Models/TransactionEventDto.cs` | Generic event with open `data` bag |
-| Queue (interface) | `Queue/IEventQueue.cs` | Contract — enables future Kafka/RabbitMQ swap |
-| Queue (impl) | `Queue/InMemoryEventQueue.cs` | Bounded `Channel<T>`, drops + logs when full |
-| Background worker | `Workers/EventProcessingWorker.cs` | Drains queue, transforms, writes |
 | Transformer | `Services/InfluxEventTransformer.cs` | Maps event → InfluxDB point |
 | Writer | `Services/InfluxDbWriter.cs` | Batched writes to InfluxDB with retry |
-| Configuration | `Configuration/*.cs` | Strongly-typed, env-var driven |
+| Configuration | `Configuration/*.cs` | Strongly-typed, env-var driven (Kafka, InfluxDb, Telemetry) |
 
 ---
 
-## 4. API surface
+## 4. Event source & format
 
-### `POST /api/events`
-Header: `X-API-Key: <key>`
+Events arrive as Kafka message values (JSON):
 ```json
 {
   "eventType": "TRANSACTION_CREATED",
-  "eventTimestamp": "2026-06-11T10:30:00Z",
+  "eventTimestamp": "2026-06-13T10:30:00Z",
   "transactionId": "TXN123456",
   "data": { "amount": 99.5, "currency": "USD" }
 }
 ```
-- `202 Accepted` → `{ "message": "received" }` (queued)
-- `400 Bad Request` → invalid/malformed payload
-- `401 Unauthorized` → missing/invalid API key
+- The `data` object is free-form → new attributes need **no code change**.
+- Malformed or incomplete messages are logged and **skipped** (one bad message never stalls the stream).
+- Numbers in `data` are stored as float for a consistent InfluxDB field type.
 
-The `data` object is free-form, so new transaction attributes require **no code changes**.
-
-### Health
+### Health (only endpoints exposed; no ingestion API)
 - `GET /health/live` → process liveness
-- `GET /health/ready` → InfluxDB reachability (unauthenticated, for orchestrators)
+- `GET /health/ready` → InfluxDB reachability
 
 ---
 
@@ -94,75 +88,47 @@ The `data` object is free-form, so new transaction attributes require **no code 
 
 | Decision | Rationale |
 |----------|-----------|
-| In-memory `Channel<T>` queue | Near-instant hand-off; decouples ingestion from storage |
-| Return 202 before DB write | Payments never wait on the database |
-| Drop-on-full (bounded queue) | A flood can never exhaust memory or block the API |
-| Interfaces for queue/writer/transformer | Swap implementations (e.g. Kafka) without touching the API |
+| Kafka as the event source | Durable, replayable buffer; decouples producers from storage |
+| Store offset only after handing to writer | At-least-once delivery; a crash re-delivers rather than loses |
+| Skip-and-log bad messages | One malformed message can't stall the consumer |
 | Generic `data` dictionary | Supports future transaction attributes without redesign |
+| Interfaces for writer/transformer | Implementations swappable without touching the consumer |
 | Env-var configuration | No hardcoded secrets; same image across environments |
-| Constant-time, fail-closed auth | Secure by default; no key configured = reject all |
-| Batched InfluxDB writes | High write throughput (see §7) |
+| Batched InfluxDB writes | High write throughput (see §7/§8) |
 
 ---
 
-## 6. Security & configuration
+## 6. Configuration
 
-- **Authentication:** shared secret in `X-API-Key`, compared in constant time, fail-closed.
-- **Configuration (no hardcoded values):** API key, queue size, retry count, InfluxDB
-  URL/token/org/bucket, and log level — all via environment variables / `appsettings.json`.
-- **Health endpoints** are intentionally unauthenticated for monitoring tools.
+- **No hardcoded values:** Kafka brokers/topic/group, InfluxDB URL/token/org/bucket,
+  retry count, and log level — all via environment variables / `appsettings.json`.
+- **Health endpoints** are unauthenticated for monitoring tools.
 
 ---
 
 ## 7. Testing & results
 
 ### 7.1 Unit tests — `dotnet test`
-**9/9 passing.** Cover the bounded queue (drop behaviour), the event→point transformer
-(field typing), and the API-key authenticator (accept/reject/fail-closed).
+**6/6 passing.** Cover the event→point transformer (field typing, including the
+numeric float-consistency fix) and the JSON deserialisation the Kafka consumer relies on.
 
-### 7.2 Functional checks (live probe, clean database)
-| Check | Expected | Result |
-|-------|----------|--------|
-| Accept valid event | 202 | **202 PASS** (100/100) |
-| Reject invalid API key | 401 | **401 PASS** |
-| Reject malformed payload | 400 | **400 PASS** |
-| Latency p95 | low | **27.5 ms** |
-
-### 7.3 Load test — k6, ramped 0→500 concurrent users over 65s
-
-| Metric | Result |
-|--------|--------|
-| Total requests | **1,147,294** |
-| Throughput | **~17,650 requests/sec** |
-| HTTP success | **100.00%** (zero failures) |
-| Latency avg / p95 / max | 9.2 ms / **25.8 ms** / 252 ms |
-| API CPU / memory | ~idle / ~450 MB |
-
-**Conclusion:** the endpoint sustains 17k+ requests/sec at sub-30ms p95 with zero
-failures and trivial CPU. It comfortably meets the "never slow down payments" requirement.
+### 7.2 End-to-end pipeline (Kafka → consumer → InfluxDB → Grafana)
+Verified by publishing transaction-lifecycle events to the Kafka topic with
+`scripts/produce-events.ps1` and confirming they appear in InfluxDB (counts by event type)
+and on the Grafana dashboard. Malformed messages are skipped and logged; valid events are
+written. The consumer uses at-least-once delivery (offset stored only after handing to the writer).
 
 ---
 
-## 8. Performance improvement: batched writes
+## 8. Storage throughput: batched writes
 
-Load testing revealed the **storage writer** — not the endpoint — as the bottleneck.
-The original writer issued one network round-trip per event (~30 events/sec), so under
-sustained overload the bounded queue overflowed and most events were dropped (by design,
-to protect the endpoint).
-
-**Fix:** switched the writer to the InfluxDB client's buffered **batch** API (flush every
-5,000 points or 1 second), isolated entirely behind the `IInfluxWriter` interface.
-
-| Metric (under identical load) | Before | After |
-|-------------------------------|--------|-------|
-| Storage throughput | ~30 events/sec | **~17,500 events/sec** |
-| Persisted-under-load rate | ~1% | **~99%** |
-| Endpoint latency / success | unchanged | unchanged |
-
-A secondary latent bug was found and fixed during this work: numeric values in the open
-`data` bag were sometimes stored as integer and sometimes as float, causing InfluxDB
-field-type conflicts that silently dropped points. Numeric fields are now consistently
-stored as float.
+The InfluxDB writer uses the client's buffered **batch** API (flush every 5,000 points or
+1 second) rather than one network round-trip per event. Under the previous HTTP architecture
+this was measured to raise storage throughput from ~30 events/sec to ~17,500 events/sec
+(~580×); the same batched writer is reused unchanged here, so the consumer can drain Kafka
+at high rate. A latent bug was also fixed: numeric values in the open `data` bag are now
+always stored as float, avoiding InfluxDB int/float field-type conflicts that previously
+dropped points.
 
 ---
 
@@ -170,18 +136,19 @@ stored as float.
 
 | Trade-off | Impact | Mitigation / note |
 |-----------|--------|-------------------|
-| In-memory queue | Buffered events lost if the process crashes | Acceptable for non-critical telemetry; `IEventQueue` allows a durable queue (Kafka/Redis) later |
-| Drop-on-overload | Events dropped if sustained load exceeds writer rate | Far less likely after batching; logged when it happens |
 | Batch flush window (~1s) | Up to ~1s before events appear in Grafana | Negligible for dashboards |
+| At-least-once delivery | A crash mid-batch may re-deliver, creating duplicate points | InfluxDB overwrites points with identical tags+timestamp, limiting impact |
 | `transactionId` as a tag | High series cardinality at very large scale | Fine at expected volumes; can move to a field if needed |
-| Single static API key | No per-client keys / rotation; plain HTTP locally | Add TLS + per-client keys for production ingress |
+| Single-partition consumer | Throughput bounded by one consumer at very high volume | Scale out: add topic partitions + run multiple instances in the same group |
+| Plain-text Kafka (local) | No encryption/auth on the broker locally | Use SASL/TLS for production brokers |
 
 ---
 
 ## 10. Deployment
 
 `docker compose` brings up the full stack:
-- **API** → `:8080`
+- **Kafka** → `kafka:9092` (KRaft single node, internal)
+- **TTS service** → `:8080` (health checks only)
 - **InfluxDB** → `:8086` (auto-initialised: org, bucket, token)
 - **Grafana** → `:3000` (datasource + dashboard auto-provisioned)
 
@@ -189,8 +156,8 @@ stored as float.
 docker compose -f docker/docker-compose.yml --env-file .env up -d --build
 ```
 
-Tooling included: `scripts/send-events.ps1` (trial generator), `scripts/load-test.js`
-(k6 load test), `scripts/generate-report.ps1` (report generator).
+Tooling included: `scripts/produce-events.ps1` (Kafka test producer) and
+`scripts/generate-report.ps1` (report generator).
 
 ---
 
@@ -198,22 +165,22 @@ Tooling included: `scripts/send-events.ps1` (trial generator), `scripts/load-tes
 
 | Criterion | Status |
 |-----------|--------|
-| Gateway can send transaction events | ✅ `POST /api/events` → 202 |
-| Events accepted without affecting payment performance | ✅ p95 ~26 ms, fire-and-forget |
-| Events written to InfluxDB asynchronously | ✅ background worker, verified stored |
+| Service subscribes to Kafka and consumes events | ✅ `KafkaConsumerWorker` subscribes to the topic |
+| Each received message updates InfluxDB | ✅ transform + batched write, verified stored |
+| No ingestion API exposed | ✅ only `/health/*` endpoints served |
+| Events written asynchronously, no impact on producers | ✅ consumer-side, decoupled via Kafka |
 | Grafana can visualise the data | ✅ provisioned dashboard |
-| Failures logged and retried | ✅ retry + logging in writer |
+| Failures logged; bad messages skipped; writes retried | ✅ consumer + writer error handling |
 | Supports future transaction attributes without redesign | ✅ open `data` bag |
-| Security via API key | ✅ enforced (401 on bad key) |
 
 ---
 
 ## 12. Conclusion
 
-TTS meets every functional and non-functional requirement. The endpoint is highly
-performant (17k+ req/sec, sub-30ms p95, zero failures) and correctly prioritises payment
-safety through asynchronous, fire-and-forget ingestion. Load testing surfaced and resolved
-a storage-throughput bottleneck (≈580× improvement via batching) and a latent field-type
-bug. The interface-driven design leaves clean upgrade paths (durable queue, TLS,
-per-client auth) for future production hardening. The solution is containerised, tested,
-documented, and version-controlled.
+TTS meets every functional and non-functional requirement under the revised Kafka-based
+ingestion model. It subscribes to the transaction-events topic, transforms each message,
+and persists it to InfluxDB via batched writes, with at-least-once delivery and resilient
+handling of malformed messages. The reusable core (event model, transformer, batched writer)
+carried over unchanged from the previous HTTP design — the swap from API ingestion to a Kafka
+consumer touched only the entry layer, demonstrating the value of the interface-driven
+structure. The solution is containerised, tested, documented, and version-controlled.

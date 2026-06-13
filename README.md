@@ -1,68 +1,67 @@
 # Transaction Telemetry Service (TTS)
 
-A lightweight .NET 8 API that captures transaction telemetry events from a payment
-gateway and stores them in InfluxDB for real-time monitoring in Grafana.
+A lightweight .NET 8 service that **consumes transaction telemetry events from Kafka** and
+stores them in InfluxDB for real-time monitoring in Grafana.
 
-**Core principle:** the payment gateway must never wait for a database. The API accepts
-an event, drops it on an in-memory queue, returns `202 Accepted` immediately, and a
-background worker writes to InfluxDB at its own pace with retries.
+**Core principle:** the service is not in the payment path. Transaction events are already
+published to Kafka by upstream systems; TTS subscribes to that topic and, for every message,
+writes the event to InfluxDB. It exposes **no ingestion API** — Kafka is the durable event source.
 
 ## Architecture
 
 ```
-Payment Gateway
-      │  POST /api/events  (X-API-Key)
-      ▼
-ApiKeyMiddleware ──► EventsController ──► IEventQueue (Channel<T>)
-                                              │  202 returned here
-                                              ▼
-                          EventProcessingWorker (BackgroundService)
-                                              │
-              IEventTransformer ──► IInfluxWriter (retry + backoff)
-                                              ▼
-                                          InfluxDB ──► Grafana
+Upstream systems ──► Kafka topic (transaction-events)
+                          │  subscribe
+                          ▼
+              KafkaConsumerWorker (BackgroundService)
+                          │
+        IEventTransformer ──► IInfluxWriter (batched, retry)
+                          ▼
+                      InfluxDB ──► Grafana
 ```
 
 | Layer | Files |
 |-------|-------|
-| Middleware | `Middleware/ApiKeyMiddleware.cs` — `X-API-Key` gate, fail-closed |
-| Controller | `Controllers/EventsController.cs` — `POST /api/events` → 202 |
+| Consumer | `Workers/KafkaConsumerWorker.cs` — subscribes, deserialises, transforms, writes |
 | Models | `Models/TransactionEventDto.cs` — generic event + open `data` bag |
-| Queue | `Queue/IEventQueue.cs`, `Queue/InMemoryEventQueue.cs` |
-| Worker | `Workers/EventProcessingWorker.cs` |
-| Services | `Services/IEventTransformer.cs`, `InfluxEventTransformer.cs`, `IInfluxWriter.cs`, `InfluxDbWriter.cs` |
-| Config | `Configuration/TelemetryOptions.cs`, `InfluxDbOptions.cs` |
+| Transformer | `Services/InfluxEventTransformer.cs` — event → InfluxDB point |
+| Writer | `Services/InfluxDbWriter.cs` — batched writes with retry |
+| Config | `Configuration/KafkaOptions.cs`, `InfluxDbOptions.cs`, `TelemetryOptions.cs` |
+| Host | `Program.cs` — registers the consumer; serves only health endpoints |
 
-## API
-
-`POST /api/events` — header `X-API-Key: <key>`
+## Event format (Kafka message value)
 
 ```json
 {
   "eventType": "TRANSACTION_CREATED",
-  "eventTimestamp": "2026-06-11T10:30:00Z",
+  "eventTimestamp": "2026-06-13T10:30:00Z",
   "transactionId": "TXN123456",
   "data": { "amount": 99.5, "currency": "USD" }
 }
 ```
 
-Returns `202 Accepted` with `{ "message": "received" }`. The `data` object is free-form —
-new transaction attributes need no code change.
+The `data` object is free-form — new transaction attributes need no code change. Malformed or
+incomplete messages are logged and skipped. Numbers in `data` are stored as float for a
+consistent InfluxDB field type.
 
-Health: `GET /health/live`, `GET /health/ready` (InfluxDB ping) — both unauthenticated.
+## Endpoints
+
+Only operational health checks (no ingestion API):
+- `GET /health/live` — process liveness
+- `GET /health/ready` — InfluxDB reachability
 
 ## Configuration
 
-Bound from `appsettings.json`, overridable by environment variables
-(`Telemetry__ApiKey`, `InfluxDb__Token`, ...). See [.env.example](.env.example).
+Bound from `appsettings.json`, overridable by environment variables. See [.env.example](.env.example).
 
 | Setting | Env var | Default |
 |---------|---------|---------|
-| API key | `Telemetry__ApiKey` | _(empty → rejects all)_ |
-| Queue size | `Telemetry__QueueSize` | 10000 |
-| Retry count | `Telemetry__RetryCount` | 5 |
-| InfluxDB URL | `InfluxDb__Url` | http://localhost:8086 |
-| InfluxDB token / org / bucket | `InfluxDb__Token` / `__Organisation` / `__Bucket` | _(empty)_ |
+| Kafka brokers | `Kafka__BootstrapServers` | localhost:9092 |
+| Kafka topic | `Kafka__Topic` | transaction-events |
+| Consumer group | `Kafka__GroupId` | tts-influx-writer |
+| Offset reset | `Kafka__AutoOffsetReset` | Earliest |
+| Write retries | `Telemetry__RetryCount` | 5 |
+| InfluxDB URL / token / org / bucket | `InfluxDb__*` | _(from env)_ |
 
 ## Running
 
@@ -71,22 +70,27 @@ Bound from `appsettings.json`, overridable by environment variables
 dotnet test
 ```
 
-### API locally
-```powershell
-$env:Telemetry__ApiKey = "test-key"
-dotnet run --project src/Tts.Api
-```
-
-### Full stack (API + InfluxDB + Grafana)
+### Full stack (Kafka + API + InfluxDB + Grafana)
 Requires Docker Desktop.
 ```powershell
 Copy-Item .env.example .env   # then edit .env with real secrets
-docker compose -f docker/docker-compose.yml --env-file .env up --build
+docker compose -f docker/docker-compose.yml --env-file .env up -d --build
 ```
-- API → http://localhost:8080
+- Kafka → `kafka:9092` (internal)
 - InfluxDB → http://localhost:8086
 - Grafana → http://localhost:3000 (dashboard auto-provisioned)
 
+### Publish test events to Kafka
+```powershell
+.\scripts\produce-events.ps1 -Count 100
+```
+The consumer writes them to InfluxDB; view them on the Grafana **Transaction Telemetry** dashboard.
+
+### Generate a report
+```powershell
+.\scripts\generate-report.ps1
+```
+
 ## Tech stack
 
-.NET 8 · ASP.NET Core · InfluxDB 2.7 · Grafana · Docker
+.NET 8 · Confluent.Kafka · Apache Kafka (KRaft) · InfluxDB 2.7 · Grafana · Docker
